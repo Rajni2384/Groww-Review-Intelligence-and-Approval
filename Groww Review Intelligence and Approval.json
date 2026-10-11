@@ -1,0 +1,461 @@
+{
+  "name": "Groww Review Intelligence and Approval",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "da03e36f-5004-4640-be2c-52b8bb0b1c5a",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -192,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "content": "SETUP REQUIRED\n1) Put your reviews CSV in Google Drive with columns: review_id, review_date, rating, review_text, source, source_url.\n2) Configure Google Drive download and CSV extraction nodes.\n3) Connect an OpenAI credential and select a model.\n4) Configure Google Docs + Gmail credentials.\n5) Review the fee issue and sources before approval.\n\nThis importable starter keeps all external write actions behind an explicit approval form. It does not contain credentials.",
+        "height": 280,
+        "width": 420
+      },
+      "id": "e6c45778-3fae-4c8e-8c60-e2a9a79a7412",
+      "name": "Setup Instructions",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        48,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst rows = $input.all().map(item => {\n  const r = item.json;\n  const normalized = {};\n  for (const [key, value] of Object.entries(r)) {\n    normalized[key.trim().toLowerCase()] = value;\n  }\n  return normalized;\n});\n\nconst reviews = rows\n  .filter(r => r.review_text && r.review_date)\n  .map((r, i) => ({\n    review_id: String(r.review_id || `ROW-${i + 1}`),\n    review_date: String(r.review_date).trim(),\n    rating: Number(r.rating || 0),\n    review_text: String(r.review_text).trim(),\n    source: String(r.source || ''),\n    source_url: String(r.source_url || '')\n  }));\n\nif (reviews.length < 3) {\n  throw new Error(`Only ${reviews.length} reviews found.`);\n}\n\nreturn [{\n  json: {\n    product: 'Groww',\n    review_count: reviews.length,\n    reviewsJson: JSON.stringify(reviews)\n  }\n}];\n"
+      },
+      "id": "176a8758-63c0-4c1c-975f-075d03e138ee",
+      "name": "Validate and Prepare Reviews",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\n\n// Extract the model response from the OpenAI node.\nconst rawText =\n  item.output?.[0]?.content?.find(c => c.type === 'output_text')?.text\n  ?? item.output?.[0]?.content?.[0]?.text\n  ?? item.text\n  ?? item.message?.content;\n\nif (typeof rawText !== 'string' || !rawText.trim()) {\n  throw new Error(\n    'Could not find the AI response text. Inspect the Message a model output.'\n  );\n}\n\nlet analysis;\n\ntry {\n  // Remove optional Markdown code fences if present.\n  const cleaned = rawText\n    .trim()\n    .replace(/^```(?:json)?\\s*/i, '')\n    .replace(/\\s*```$/, '');\n\n  analysis = JSON.parse(cleaned);\n} catch (error) {\n  throw new Error(\n    `AI response is not valid JSON: ${error.message}`\n  );\n}\n\nif (!Array.isArray(analysis.themes)) {\n  throw new Error('Missing or invalid themes array.');\n}\n\nif (!Array.isArray(analysis.top_3_themes)) {\n  throw new Error('Missing or invalid top_3_themes array.');\n}\n\nif (!Array.isArray(analysis.user_quotes)) {\n  throw new Error('Missing or invalid user_quotes array.');\n}\n\nif (!analysis.fee_issue || typeof analysis.fee_issue.identified !== 'boolean') {\n  throw new Error('Missing or invalid fee_issue.');\n}\n\nreturn [{\n  json: {\n    product: 'Groww',\n    analysis,\n    themes: analysis.themes,\n    top_3_themes: analysis.top_3_themes,\n    user_quotes: analysis.user_quotes,\n    fee_issue: analysis.fee_issue,\n    limitations: analysis.limitations || []\n  }\n}];\n"
+      },
+      "id": "51f49a09-897a-48ce-a9a9-1e23856f03f2",
+      "name": "Parse and Validate Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst item = $input.first().json;\n\n// Extract text from the OpenAI Message a model output.\nconst raw = item.output?.[0]?.content?.find(\n  c => c.type === 'output_text'\n)?.text ?? item.output?.[0]?.content?.[0]?.text;\n\nif (typeof raw !== 'string' || !raw.trim()) {\n  throw new Error(\n    'Could not find response text. Check Generate Pulse and Fee Explainer output.'\n  );\n}\n\nconst cleaned = raw.trim()\n  .replace(/^```(?:json)?\\s*/i, '')\n  .replace(/\\s*```$/, '');\n\nlet data;\n\ntry {\n  data = JSON.parse(cleaned);\n} catch (e) {\n  throw new Error(`AI response is not valid JSON: ${e.message}`);\n}\n\n// Validate weekly pulse.\nif (typeof data.weekly_pulse !== 'string' || !data.weekly_pulse.trim()) {\n  throw new Error('weekly_pulse is missing or empty.');\n}\n\nconst wordCount = data.weekly_pulse.trim().split(/\\s+/).length;\n\nif (wordCount > 250) {\n  throw new Error(`Weekly pulse exceeds 250 words (${wordCount}).`);\n}\n\n// Validate fee explainer.\nconst fee = data.fee_explainer;\n\nif (!fee || typeof fee !== 'object') {\n  throw new Error('fee_explainer is missing.');\n}\n\nif (!Array.isArray(fee.bullets)) {\n  throw new Error('fee_explainer.bullets must be an array.');\n}\n\nif (fee.bullets.length > 6) {\n  throw new Error('Fee explainer exceeds six bullets.');\n}\n\nif (!Array.isArray(fee.official_sources)) {\n  throw new Error('official_sources must be an array.');\n}\n\nif (fee.applicable && fee.official_sources.length < 2) {\n  throw new Error('An applicable fee explainer needs two official sources.');\n}\n\nreturn [{\n  json: {\n    product: 'Groww',\n    weekly_pulse: data.weekly_pulse,\n    fee_explainer: fee,\n    validation: {\n      passed: true,\n      weekly_pulse_word_count: wordCount,\n      fee_bullet_count: fee.bullets.length\n    }\n  }\n}];\n"
+      },
+      "id": "24088fac-d892-45ed-adf6-f392b55666d9",
+      "name": "Validate Deliverables",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1360,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "approval-condition",
+              "leftValue": "={{ $json.Decision }}",
+              "rightValue": "Approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "64152b2d-ae4a-4092-8f42-9b7dc060162f",
+      "name": "IF Approved",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1856,
+        -48
+      ]
+    },
+    {
+      "parameters": {
+        "content": "APPROVED BRANCH ONLY\nAdd Google Docs append and Gmail Create Draft nodes here after setting credentials. Do not use Gmail Send. Map content from 'Validate Deliverables'.",
+        "height": 220,
+        "width": 350
+      },
+      "id": "29bdd1d8-f4a9-43f9-8ed5-80c2d12e3bb1",
+      "name": "Approved — Add Google Docs and Gmail",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2128,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "content": "REJECTED\nLeave this branch without external write actions. Optionally add a notification or log the rejection.",
+        "width": 300
+      },
+      "id": "6bc3f70e-b065-44cd-8d69-1fb92a376df0",
+      "name": "Rejected — No Writes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2128,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "1LKr5l7ltpwUqTnBkXiGxAlfhGagK_ruT",
+          "mode": "list",
+          "cachedResultName": "groww_public_reviews_seed_sample.csv",
+          "cachedResultUrl": "https://drive.google.com/file/d/1LKr5l7ltpwUqTnBkXiGxAlfhGagK_ruT/view?usp=drivesdk"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        32,
+        0
+      ],
+      "id": "9a0eae30-91a2-41ba-87e0-ace315e17b80",
+      "name": "Download file",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "z5YBc2ohXyW4QiHU",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        176,
+        96
+      ],
+      "id": "e774d5aa-85c8-4d69-8e1a-29d20db2ba37",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You are a customer-review analyst for Groww, an Indian investment platform.\n\nAnalyze the reviews provided below. Use only the supplied evidence.\n\nREVIEWS:\n{{ $json.reviewsJson }}\n\nReturn a valid JSON object with these keys:\n\n{\n  \"themes\": [\n    {\n      \"name\": \"Theme name\",\n      \"review_count\": 0,\n      \"evidence\": \"Evidence-based summary\"\n    }\n  ],\n  \"top_3_themes\": [\"Theme 1\", \"Theme 2\", \"Theme 3\"],\n  \"user_quotes\": [\n    {\n      \"review_id\": \"Exact review ID\",\n      \"quote\": \"Exact verbatim quote from the review\"\n    }\n  ],\n  \"fee_issue\": {\n    \"identified\": false,\n    \"fee_name\": \"\",\n    \"evidence_review_ids\": [],\n    \"explanation\": \"Explain the evidence or state that no recurring fee misunderstanding is established\"\n  },\n  \"limitations\": []\n}\n\nRules:\n- Use no more than 5 themes.\n- Rank themes by the number of reviews supporting them.\n- Include 3 exact quotes when at least 3 usable reviews are available.\n- Never invent quotes, review IDs, fees, or counts.\n- Identify a recurring fee misunderstanding only if at least 3 distinct reviews directly support it.\n- If no recurring fee misunderstanding is supported, set identified to false.\n- Mention the small sample size and limited date coverage in limitations.\n- Return JSON only. Do not use Markdown fences."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        624,
+        -16
+      ],
+      "id": "45dcb857-dacc-488b-9208-976b5a4742fd",
+      "name": "Validate and Prepare Reviews1",
+      "credentials": {
+        "openAiApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "content": "=You are preparing a weekly customer-review intelligence report for Groww, an Indian investment platform.\n\nINPUT ANALYSIS:\n{{ JSON.stringify($json.analysis) }}\n\nUse only the supplied analysis for review findings. Do not invent statistics, customer quotes, fees, or policies.\n\nReturn one valid JSON object with exactly these fields:\n{\n  \"weekly_pulse\": \"A concise report of no more than 250 words. Include the top three themes, evidence-based observations, and sample limitations.\",\n  \"fee_explainer\": {\n    \"applicable\": false,\n    \"title\": \"Fee clarification\",\n    \"bullets\": [],\n    \"official_sources\": [],\n    \"last_checked\": \"2026-10-11\",\n    \"evidence_note\": \"Explain whether the supplied analysis establishes a recurring fee misunderstanding.\"\n  }\n}\n\nRules:\n1. Keep weekly_pulse under 250 words.\n2. If the analysis establishes a specific recurring fee misunderstanding, set applicable to true and provide no more than 6 concise bullets explaining only what the evidence supports.\n3. If no recurring fee misunderstanding is established, keep applicable false and bullets empty. Do not invent a fee issue.\n4. Populate official_sources with two verified, relevant official Groww URLs if you can verify them. Each entry must contain title and url. Do not fabricate URLs. If you cannot verify appropriate official sources, return an empty array and explain this in evidence_note.\n5. Use the actual date 2026-10-11 for last_checked.\n6. Mention that the sample contains only 8 reviews and has limited date coverage.\n7. Return JSON only, without Markdown fences.\n\nOFFICIAL SOURCES:\nAlways include these two supplied official Groww sources in fee_explainer.official_sources, even when no recurring fee misunderstanding is established:\n1. {\"title\":\"Groww Pricing and Charges\",\"url\":\"https://groww.in/pricing\"}\n2. {\"title\":\"What fees does Groww charge?\",\"url\":\"https://groww.in/help/payments-%26-withdrawals/payments-charges/what-fees-does-groww-charge--58\"}\n\nDo not claim that these sources prove a customer misunderstanding. They are official references only. Keep fee_explainer.applicable false unless the supplied reviews establish a recurring fee misunderstanding. Preserve the existing JSON structure."
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1056,
+        -32
+      ],
+      "id": "4f8957af-9cfa-4903-95fa-e0f5e9e22439",
+      "name": "Generate Pulse and Fee Explainer",
+      "credentials": {
+        "openAiApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resume": "form",
+        "formTitle": "=Review the generated Groww customer-review report. Approve to save the report and create a Gmail draft, or reject to stop external actions.",
+        "formDescription": "Review the weekly Groww customer-review pulse and fee explainer. Select Approve to continue to Google Docs and Gmail draft creation, or Reject to stop external actions.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Decision",
+              "fieldType": "dropdown",
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Approve"
+                  },
+                  {
+                    "option": "Reject"
+                  }
+                ]
+              },
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1584,
+        96
+      ],
+      "id": "72741dd3-e858-4652-8b61-b287525281b6",
+      "name": "Wait For Approval",
+      "webhookId": "d9475f62-4628-4b7e-ab8f-f5d7a9aa983d"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentURL": "https://docs.google.com/document/d/1Hi3DOaeaMEypymWihB8CfET6HNL04N7KofgVnhOlY9k/edit?tab=t.0#heading=h.uo12sllxsfxe",
+        "actionsUi": {
+          "actionFields": [
+            {
+              "action": "insert",
+              "text": "=\n{{\n  'GROWW WEEKLY PRODUCT PULSE\\n\\n' +\n  ($('Validate Deliverables').first().json.weekly_pulse || 'Weekly pulse missing') +\n  '\\n\\nFEE EXPLAINER\\n\\n' +\n  (\n    $('Validate Deliverables').first().json.fee_explainer?.applicable === true\n      ? (\n          ($('Validate Deliverables').first().json.fee_explainer.title || '') +\n          '\\n' +\n          ($('Validate Deliverables').first().json.fee_explainer.bullets || []).join('\\n')\n        )\n      : 'Not applicable: the supplied reviews do not establish a recurring fee misunderstanding.'\n  ) +\n  '\\n\\nOFFICIAL SOURCES\\n' +\n  (\n    ($('Validate Deliverables').first().json.fee_explainer?.official_sources || [])\n      .map(s => typeof s === 'string'\n        ? s\n        : (s.title || 'Official source') + ': ' + (s.url || ''))\n      .join('\\n') || 'No official source links were provided by the analysis step.'\n  ) +\n  '\\n\\nLast checked: ' +\n  ($('Validate Deliverables').first().json.fee_explainer?.last_checked || '2026-10-11') +\n  '\\n\\nEvidence note: ' +\n  ($('Validate Deliverables').first().json.fee_explainer?.evidence_note ||\n   'No recurring fee misunderstanding is established in the supplied sample.')\n}}\n"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.googleDocs",
+      "typeVersion": 2,
+      "position": [
+        2080,
+        -144
+      ],
+      "id": "4d0c688c-0794-464f-a4f2-77eacae82f8b",
+      "name": "Document",
+      "credentials": {
+        "googleDocsOAuth2Api": {
+          "id": "Pi6UyBs9CyjwZQtk",
+          "name": "Google Docs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "Weekly Groww Customer Review Pulse",
+        "message": "=\n{{\n  'Hi Team,\\n\\n' +\n  'Please review this week’s Groww customer feedback pulse.\\n\\n' +\n  'WEEKLY PULSE\\n' +\n  ($('Validate Deliverables').first().json.weekly_pulse || 'Weekly pulse missing — please check the analysis output.') +\n  '\\n\\nFEE EXPLAINER\\n' +\n  (\n    $('Validate Deliverables').first().json.fee_explainer?.applicable === true\n      ? (\n          ($('Validate Deliverables').first().json.fee_explainer.title || 'Fee clarification') + '\\n' +\n          ($('Validate Deliverables').first().json.fee_explainer.bullets || []).join('\\n')\n        )\n      : 'No recurring fee misunderstanding was established by the available reviews.'\n  ) +\n  '\\n\\nOFFICIAL SOURCES\\n' +\n  (\n    ($('Validate Deliverables').first().json.fee_explainer?.official_sources || [])\n      .map(s => typeof s === 'string'\n        ? s\n        : (s.title || 'Official source') + ': ' + (s.url || '')\n      )\n      .join('\\n')\n    || 'Groww Pricing and Charges: https://groww.in/pricing\\n' +\n       'What fees does Groww charge?: https://groww.in/help/payments-%26-withdrawals/payments-charges/what-fees-does-groww-charge--58'\n  ) +\n  '\\n\\nLast checked: ' +\n  ($('Validate Deliverables').first().json.fee_explainer?.last_checked || '2026-10-11') +\n  '\\n\\nEvidence note: ' +\n  ($('Validate Deliverables').first().json.fee_explainer?.evidence_note ||\n   'The supplied sample does not establish a recurring fee misunderstanding.') +\n  '\\n\\nPlease review before sharing.\\n\\nRegards,\\nGroww Review Intelligence'\n}}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2080,
+        48
+      ],
+      "id": "b2c8ee52-d99d-4788-86ba-eb7158490342",
+      "name": "Create a draft",
+      "webhookId": "c149f87e-ada7-439e-8379-62c307524287",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "bE1nEmmGrwDx6oEh",
+          "name": "Gmail account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Validate Deliverables": {
+      "main": [
+        [
+          {
+            "node": "Wait For Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate and Prepare Reviews": {
+      "main": [
+        [
+          {
+            "node": "Validate and Prepare Reviews1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Download file",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download file": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Validate and Prepare Reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Validate Analysis": {
+      "main": [
+        [
+          {
+            "node": "Generate Pulse and Fee Explainer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate and Prepare Reviews1": {
+      "main": [
+        [
+          {
+            "node": "Parse and Validate Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Pulse and Fee Explainer": {
+      "main": [
+        [
+          {
+            "node": "Validate Deliverables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait For Approval": {
+      "main": [
+        [
+          {
+            "node": "IF Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Approved": {
+      "main": [
+        [
+          {
+            "node": "Document",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create a draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "versionId": "fc9a597b-7504-4362-88a2-9dd90b0e14ea",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "dc8a0276ae8244bf0e4330604468302e92e1510b000b99a0d9dadd1e84db7207"
+  },
+  "nodeGroups": [],
+  "id": "ugHrEcE9C9Poegth",
+  "tags": []
+}
